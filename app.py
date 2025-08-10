@@ -4,9 +4,13 @@ import os
 import requests
 import sqlite3
 from datetime import datetime
+import logging
 import anthropic
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
 # Environment variables
 VERIFY_TOKEN = os.environ.get('WHATSAPP_VERIFY_TOKEN')
