@@ -15,7 +15,7 @@ PHONE_NUMBER_ID = os.environ.get('WHATSAPP_PHONE_NUMBER_ID')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
 # Initialize Claude client (fixed initialization)
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+claude_client = anthropic.Anthropic()
 
 # Database setup
 def init_db():
