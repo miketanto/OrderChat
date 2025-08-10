@@ -4,18 +4,18 @@ import os
 import requests
 import sqlite3
 from datetime import datetime
-from anthropic import Anthropic
+import anthropic
 
 app = Flask(__name__)
 
-# Environment variables (no .env file needed on Render)
+# Environment variables
 VERIFY_TOKEN = os.environ.get('WHATSAPP_VERIFY_TOKEN')
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_ACCESS_TOKEN')
 PHONE_NUMBER_ID = os.environ.get('WHATSAPP_PHONE_NUMBER_ID')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
-# Initialize Claude client
-claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+# Initialize Claude client (fixed initialization)
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Database setup
 def init_db():
@@ -109,9 +109,13 @@ def send_whatsapp_message(to_phone_number, message_text):
         "text": {"body": message_text}
     }
     
-    response = requests.post(url, headers=headers, json=data)
-    app.logger.info(f"WhatsApp API Response: {response.status_code}")
-    return response
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        app.logger.info(f"WhatsApp API Response: {response.status_code}")
+        return response
+    except Exception as e:
+        app.logger.error(f"WhatsApp send error: {e}")
+        return None
 
 def get_claude_response(user_message, customer_phone):
     """Get response from Claude with conversation context"""
@@ -183,6 +187,8 @@ def handle_message():
             
     except KeyError as e:
         app.logger.error(f"Error parsing webhook data: {e}")
+    except Exception as e:
+        app.logger.error(f"General error: {e}")
     
     return jsonify({"status": "received"}), 200
 
