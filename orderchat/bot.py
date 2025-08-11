@@ -12,11 +12,9 @@ from .db import (
 )
 from .rules import HeuristicGate, parse_simple_order
 from .llm import extract_order_with_claude
-from .embeddings import IntentGate
 
 bot_bp = Blueprint('bot', __name__)
 log = logging.getLogger(__name__)
-intent_gate = IntentGate()
 
 
 def send_whatsapp_message(to_phone_number, message_text):
@@ -92,11 +90,9 @@ def handle_message():
             # Try simple parser first
             items, total = parse_simple_order(message_text, MENU)
             used_llm = False
-            if items:
-                pass
-            else:
-                # If classifier says this doesn't look like an order intent strongly, avoid LLM
-                if intent_gate.should_gate_llm(message_text):
+            if not items:
+                # If it doesn't look like an order, avoid LLM
+                if not gate.looks_like_order(message_text):
                     send_whatsapp_message(customer_phone, "I'm here to help with ordering. Try: '2 Pizza Margherita'.")
                     return jsonify({"status": "ok"})
                 # Fallback to LLM extraction
