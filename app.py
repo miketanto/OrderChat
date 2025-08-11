@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 import logging
 import anthropic
+import re
 
 app = Flask(__name__)
 
@@ -21,6 +22,14 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 # Initialize Claude client (fixed initialization)
 claude_client = anthropic.Anthropic()
 
+# Define menu for validation and pricing
+MENU = {
+    "pizza margherita": 12.0,
+    "chicken caesar salad": 8.0,
+    "spaghetti carbonara": 10.0,
+    "chocolate cake": 6.0,
+}
+
 # Database setup
 def init_db():
     """Initialize SQLite database"""
@@ -33,6 +42,18 @@ def init_db():
             phone_number TEXT UNIQUE,
             messages TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # New orders table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT,
+            items TEXT, -- JSON array of {name, quantity, unit_price}
+            total REAL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -79,6 +100,140 @@ def save_conversation_message(phone_number, role, content):
     
     conn.commit()
     conn.close()
+
+# --- Orders helpers ---
+
+def save_order(phone_number: str, items: list, total: float) -> int:
+    """Persist an order and return the new order id."""
+    conn = sqlite3.connect('restaurant_bot.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        '''INSERT INTO orders (phone_number, items, total, status) VALUES (?, ?, ?, ?)''',
+        (phone_number, json.dumps(items), float(total), 'pending')
+    )
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    app.logger.info(f"Saved order #{order_id} for {phone_number} | total=${total}")
+    return order_id
+
+
+def list_orders():
+    """Fetch all orders as list of dicts."""
+    conn = sqlite3.connect('restaurant_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''SELECT id, phone_number, items, total, status, created_at FROM orders ORDER BY created_at DESC''')
+    rows = cursor.fetchall()
+    conn.close()
+    orders = []
+    for r in rows:
+        items = []
+        try:
+            items = json.loads(r[2]) if r[2] else []
+        except Exception:
+            items = []
+        orders.append({
+            "id": r[0],
+            "phone_number": r[1],
+            "items": items,
+            "total": r[3],
+            "status": r[4],
+            "created_at": r[5]
+        })
+    return orders
+
+
+def _strip_code_fences(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    # Remove ```json ... ``` or ``` ... ``` fences
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s.strip(), flags=re.IGNORECASE)
+    s = re.sub(r"```\s*$", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def _extract_first_json_object(s: str) -> str:
+    """Try to extract the first top-level JSON object substring from s."""
+    brace_stack = 0
+    start = None
+    for i, ch in enumerate(s):
+        if ch == '{':
+            if brace_stack == 0:
+                start = i
+            brace_stack += 1
+        elif ch == '}':
+            if brace_stack > 0:
+                brace_stack -= 1
+                if brace_stack == 0 and start is not None:
+                    return s[start:i+1]
+    return s
+
+
+def extract_order_with_claude(user_message: str) -> dict | None:
+    """Use Claude to extract order JSON from the user's message. Returns dict with items and total or None."""
+    try:
+        system_prompt = (
+            "You extract restaurant orders from customer messages. "
+            "Return JSON only with this shape: {\n"
+            "  \"items\": [ { \"name\": string, \"quantity\": number, \"unit_price\": number } ]\n"
+            "}. Use only these menu items and prices: "
+            + ", ".join([f"{name} - ${price}" for name, price in MENU.items()]) + ". "
+            "If no order present, return {\"items\": []}."
+        )
+        msg = [{"role": "user", "content": user_message}]
+        resp = claude_client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=200,
+            system=system_prompt,
+            messages=msg
+        )
+        raw = resp.content[0].text if resp and resp.content else ""
+        text = _strip_code_fences(raw)
+        json_str = _extract_first_json_object(text)
+        data = json.loads(json_str)
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            items = []
+        # Validate against menu and compute totals
+        normalized_menu = {k.lower(): v for k, v in MENU.items()}
+        validated_items = []
+        total = 0.0
+        for it in items:
+            try:
+                name = str(it.get("name", "")).strip().lower()
+                qty = int(it.get("quantity", 1))
+                if qty <= 0:
+                    continue
+                if name in normalized_menu:
+                    price = float(normalized_menu[name])
+                    validated_items.append({
+                        "name": name.title(),
+                        "quantity": qty,
+                        "unit_price": price,
+                        "line_total": round(price * qty, 2),
+                    })
+                    total += price * qty
+            except Exception:
+                continue
+        total = round(total, 2)
+        if validated_items and total > 0:
+            return {"items": validated_items, "total": total}
+        return None
+    except Exception as e:
+        app.logger.warning(f"Order extraction failed: {e}")
+        return None
+
+
+def detect_and_save_order(message_text: str, customer_phone: str) -> int | None:
+    """Try to detect an order from the user's message and save it. Returns order id or None."""
+    extracted = extract_order_with_claude(message_text)
+    if extracted:
+        try:
+            order_id = save_order(customer_phone, extracted["items"], extracted["total"])
+            return order_id
+        except Exception as e:
+            app.logger.error(f"Failed to save order: {e}")
+    return None
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -187,6 +342,18 @@ def handle_message():
             app.logger.info(f"Message from {customer_phone}: {message_text}")
             
             claude_response = get_claude_response(message_text, customer_phone)
+
+            # Attempt to detect and save an order from the user's message
+            order_id = detect_and_save_order(message_text, customer_phone)
+            if order_id:
+                app.logger.info(f"Order #{order_id} captured for {customer_phone}")
+                # Optionally, append a confirmation note to user
+                try:
+                    send_whatsapp_message(customer_phone, f"Thanks! I captured your order (#{order_id}). You can view it at /orders.")
+                except Exception:
+                    pass
+
+            # Send Claude's main response as usual
             send_whatsapp_message(customer_phone, claude_response)
             
     except KeyError as e:
@@ -195,6 +362,48 @@ def handle_message():
         app.logger.error(f"General error: {e}")
     
     return jsonify({"status": "received"}), 200
+
+# --- Orders viewing endpoints ---
+
+@app.route('/api/orders', methods=['GET'])
+def api_orders():
+    return jsonify({"orders": list_orders()})
+
+
+@app.route('/orders', methods=['GET'])
+def orders_page():
+    orders = list_orders()
+    # Simple HTML table view
+    rows = []
+    for o in orders:
+        items_html = "<ul>" + "".join([f"<li>{i['quantity']} x {i['name']} @ ${i['unit_price']} = ${i.get('line_total', round(i['unit_price']*i['quantity'],2))}</li>" for i in o.get('items', [])]) + "</ul>"
+        rows.append(
+            f"<tr>"
+            f"<td>{o['id']}</td>"
+            f"<td>{o['phone_number']}</td>"
+            f"<td>{items_html}</td>"
+            f"<td>${o['total']}</td>"
+            f"<td>{o['status']}</td>"
+            f"<td>{o['created_at']}</td>"
+            f"</tr>"
+        )
+    html = (
+        "<!doctype html>\n"
+        "<html lang='en'>\n<head>\n<meta charset='utf-8'/>\n<title>Orders</title>\n"
+        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;padding:24px;background:#f8fafc;color:#0f172a}"
+        "table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.06);border-radius:8px;overflow:hidden}"
+        "th,td{padding:12px 14px;border-bottom:1px solid #e2e8f0;vertical-align:top}"
+        "th{background:#f1f5f9;text-align:left;font-weight:600;color:#334155}"
+        "h1{margin:0 0 16px;font-size:24px}"
+        "ul{margin:0;padding-left:18px}" 
+        "</style>\n</head>\n<body>\n"
+        "<h1>Customer Orders</h1>\n"
+        "<table>\n<thead><tr><th>ID</th><th>Phone</th><th>Items</th><th>Total</th><th>Status</th><th>Created</th></tr></thead>\n"
+        f"<tbody>{''.join(rows) or '<tr><td colspan=6 style=\'text-align:center;padding:24px\'>No orders yet.</td></tr>'}</tbody>\n"
+        "</table>\n"
+        "</body></html>"
+    )
+    return html
 
 # Initialize database on startup
 init_db()
