@@ -3,4 +3,5 @@ requests==2.31.0
 python-dotenv==1.0.0
 anthropic
 gunicorn==21.2.0
-logging
+scikit-learn==1.5.1
+sentence-transformers==3.0.1
