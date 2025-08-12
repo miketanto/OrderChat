@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 import requests
 import logging
-from .config import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, MENU, menu_text
+from .config import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, MENU, menu_text, detect_ambiguous_terms, list_category_examples
 from .db import (
     save_order,
     set_order_draft,
@@ -56,25 +56,22 @@ def handle_message():
             gate = HeuristicGate()
             draft = get_order_draft(customer_phone)
 
-            # Require start keyword to open ordering (opens LLM phase)
             if draft is None:
                 if gate.wants_to_start(message_text):
                     set_order_draft(customer_phone, {"items": [], "total": 0.0})
                     send_whatsapp_message(
                         customer_phone,
-                        "Ordering session started. Send items and quantities (e.g. '2 pizza margherita, 1 chocolate cake').\n" + menu_text() + "\nWhen finished, reply 'confirm' to place order or 'cancel' to abort."
+                        "Ordering session started. Send items and quantities (e.g. '2 Pizza Margherita, 1 Tiramisu').\n" + menu_text() + "When finished, reply 'confirm' or 'cancel'."
                     )
                 else:
                     send_whatsapp_message(customer_phone, "Welcome! Reply with 'start' to begin ordering.\n" + menu_text())
                 return jsonify({"status": "ok"})
 
-            # Handle cancel (closes LLM usage)
             if gate.wants_to_cancel(message_text):
                 clear_order_draft(customer_phone)
                 send_whatsapp_message(customer_phone, "Order canceled. Reply 'start' to begin again.")
                 return jsonify({"status": "ok"})
 
-            # Handle confirm -> persist to orders table and end LLM phase
             if gate.wants_to_confirm(message_text):
                 if draft.get('items'):
                     order_id = save_order(customer_phone, draft['items'], draft.get('total', 0.0))
@@ -84,11 +81,20 @@ def handle_message():
                     send_whatsapp_message(customer_phone, "Your cart is empty. Add some items before confirming.")
                 return jsonify({"status": "ok"})
 
-            # Active ordering phase: always use LLM extractor (hardened)
+            # Ambiguity check before LLM call
+            ambiguous = detect_ambiguous_terms(message_text)
+            if ambiguous:
+                prompts = []
+                for cat in ambiguous:
+                    examples = list_category_examples(cat)
+                    cat_title = cat.title()
+                    prompts.append(f"Specify which {cat_title[:-1] if cat_title.endswith('s') else cat_title} you want (e.g. {examples}).")
+                send_whatsapp_message(customer_phone, "Your request is ambiguous. " + " ".join(prompts))
+                return jsonify({"status": "ok"})
+
             extracted = extract_order_with_claude(message_text)
             if extracted:
                 current = draft.get('items', [])
-                # Merge items by name to accumulate quantities
                 merged = {}
                 for it in current:
                     key = it['name'].lower()
@@ -111,12 +117,11 @@ def handle_message():
                 summary = "\n".join([f"- {i['quantity']} x {i['name']} = ${i['line_total']}" for i in new_items])
                 send_whatsapp_message(
                     customer_phone,
-                    f"Cart updated. Total ${new_total}:\n{summary}\n\nAdd more items, or 'confirm' to place, 'cancel' to abort."
+                    f"Cart updated. Total ${new_total}:\n{summary}\n\nAdd more items, or 'confirm' / 'cancel'."
                 )
                 return jsonify({"status": "ok"})
 
-            # If LLM returned nothing useful
-            send_whatsapp_message(customer_phone, "No valid items detected. Please specify menu items with quantities, or 'confirm' / 'cancel'.")
+            send_whatsapp_message(customer_phone, "No valid items detected. Please specify exact menu item names or quantities, or 'confirm' / 'cancel'.")
             return jsonify({"status": "ok"})
 
     except KeyError as e:
