@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 import requests
 import logging
-from .config import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, MENU, menu_text, detect_ambiguous_terms, list_category_examples
+from .config import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, MENU, menu_text, detect_ambiguous_terms, list_category_examples, MENU_CATEGORIES
 from .db import (
     save_order,
     set_order_draft,
@@ -81,19 +81,18 @@ def handle_message():
                     send_whatsapp_message(customer_phone, "Your cart is empty. Add some items before confirming.")
                 return jsonify({"status": "ok"})
 
-            # Ambiguity check before LLM call
-            ambiguous = detect_ambiguous_terms(message_text)
-            if ambiguous:
+            # LLM extraction handles ambiguity & fuzzy corrections
+            extracted = extract_order_with_claude(message_text)
+            if extracted and extracted.get('need_clarification'):
                 prompts = []
-                for cat in ambiguous:
+                for cat in extracted['need_clarification']:
                     examples = list_category_examples(cat)
-                    cat_title = cat.title()
-                    prompts.append(f"Specify which {cat_title[:-1] if cat_title.endswith('s') else cat_title} you want (e.g. {examples}).")
-                send_whatsapp_message(customer_phone, "Your request is ambiguous. " + " ".join(prompts))
+                    singular = cat[:-1] if cat.endswith('s') else cat
+                    prompts.append(f"Which {singular} would you like? e.g. {examples}")
+                send_whatsapp_message(customer_phone, "Need clarification: " + " | ".join(prompts))
                 return jsonify({"status": "ok"})
 
-            extracted = extract_order_with_claude(message_text)
-            if extracted:
+            if extracted and extracted.get('items'):
                 current = draft.get('items', [])
                 merged = {}
                 for it in current:
@@ -121,7 +120,7 @@ def handle_message():
                 )
                 return jsonify({"status": "ok"})
 
-            send_whatsapp_message(customer_phone, "No valid items detected. Please specify exact menu item names or quantities, or 'confirm' / 'cancel'.")
+            send_whatsapp_message(customer_phone, "No valid or specific items detected. Please specify exact menu item names, or 'confirm' / 'cancel'.")
             return jsonify({"status": "ok"})
 
     except KeyError as e:
