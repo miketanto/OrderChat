@@ -3,14 +3,12 @@ import requests
 import logging
 from .config import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, MENU, menu_text
 from .db import (
-    get_conversation_history,
-    save_conversation_message,
     save_order,
     set_order_draft,
     get_order_draft,
     clear_order_draft,
 )
-from .rules import HeuristicGate, parse_simple_order
+from .rules import HeuristicGate
 from .llm import extract_order_with_claude
 
 bot_bp = Blueprint('bot', __name__)
@@ -58,64 +56,67 @@ def handle_message():
             gate = HeuristicGate()
             draft = get_order_draft(customer_phone)
 
-            # Step 0: require keyword to start
+            # Require start keyword to open ordering (opens LLM phase)
             if draft is None:
                 if gate.wants_to_start(message_text):
                     set_order_draft(customer_phone, {"items": [], "total": 0.0})
                     send_whatsapp_message(
                         customer_phone,
-                        "Great! Let's start your order. You can say things like '2 Pizza Margherita and 1 Chocolate Cake'.\n" + menu_text()
+                        "Ordering session started. Send items and quantities (e.g. '2 pizza margherita, 1 chocolate cake').\n" + menu_text() + "\nWhen finished, reply 'confirm' to place order or 'cancel' to abort."
                     )
-                    save_conversation_message(customer_phone, 'system', 'ordering_started')
                 else:
-                    send_whatsapp_message(customer_phone, "Welcome! Reply with 'start' to begin ordering, or ask about our menu.\n" + menu_text())
+                    send_whatsapp_message(customer_phone, "Welcome! Reply with 'start' to begin ordering.\n" + menu_text())
                 return jsonify({"status": "ok"})
 
-            # Handle cancel
+            # Handle cancel (closes LLM usage)
             if gate.wants_to_cancel(message_text):
                 clear_order_draft(customer_phone)
                 send_whatsapp_message(customer_phone, "Order canceled. Reply 'start' to begin again.")
                 return jsonify({"status": "ok"})
 
-            # Handle confirm -> persist to orders table
+            # Handle confirm -> persist to orders table and end LLM phase
             if gate.wants_to_confirm(message_text):
                 if draft.get('items'):
                     order_id = save_order(customer_phone, draft['items'], draft.get('total', 0.0))
                     clear_order_draft(customer_phone)
-                    send_whatsapp_message(customer_phone, f"Thanks! Your order #{order_id} has been placed.")
+                    send_whatsapp_message(customer_phone, f"Thanks! Your order #{order_id} has been placed. LLM session closed.")
                 else:
                     send_whatsapp_message(customer_phone, "Your cart is empty. Add some items before confirming.")
                 return jsonify({"status": "ok"})
 
-            # Try simple parser first
-            items, total = parse_simple_order(message_text, MENU)
-            used_llm = False
-            if not items:
-                # If it doesn't look like an order, avoid LLM
-                if not gate.looks_like_order(message_text):
-                    send_whatsapp_message(customer_phone, "I'm here to help with ordering. Try: '2 Pizza Margherita'.")
-                    return jsonify({"status": "ok"})
-                # Fallback to LLM extraction
-                extracted = extract_order_with_claude(message_text)
-                if extracted:
-                    items = extracted['items']
-                    total = extracted['total']
-                    used_llm = True
-
-            if items:
-                new_items = draft.get('items', []) + items
-                new_total = round(sum(i.get('line_total', i['unit_price'] * i['quantity']) for i in new_items), 2)
+            # Active ordering phase: always use LLM extractor (hardened)
+            extracted = extract_order_with_claude(message_text)
+            if extracted:
+                current = draft.get('items', [])
+                # Merge items by name to accumulate quantities
+                merged = {}
+                for it in current:
+                    key = it['name'].lower()
+                    merged[key] = {
+                        'name': it['name'],
+                        'quantity': it['quantity'],
+                        'unit_price': it['unit_price'],
+                        'line_total': it.get('line_total', it['unit_price'] * it['quantity'])
+                    }
+                for it in extracted['items']:
+                    key = it['name'].lower()
+                    if key in merged:
+                        merged[key]['quantity'] += it['quantity']
+                        merged[key]['line_total'] = round(merged[key]['unit_price'] * merged[key]['quantity'], 2)
+                    else:
+                        merged[key] = it
+                new_items = list(merged.values())
+                new_total = round(sum(i['line_total'] for i in new_items), 2)
                 set_order_draft(customer_phone, {"items": new_items, "total": new_total})
-                summary = "\n".join([f"- {i['quantity']} x {i['name']} = ${i.get('line_total', i['unit_price']*i['quantity'])}" for i in new_items])
-                suffix = " (via LLM)" if used_llm else ""
+                summary = "\n".join([f"- {i['quantity']} x {i['name']} = ${i['line_total']}" for i in new_items])
                 send_whatsapp_message(
                     customer_phone,
-                    f"Added to cart{suffix}. Current total ${new_total}:\n{summary}\n\nReply 'confirm' to place the order, or add more items."
+                    f"Cart updated. Total ${new_total}:\n{summary}\n\nAdd more items, or 'confirm' to place, 'cancel' to abort."
                 )
                 return jsonify({"status": "ok"})
 
-            # Not an order-like message
-            send_whatsapp_message(customer_phone, "I can add items to your cart. For example: '2 Pizza Margherita'. When ready, reply 'confirm'.")
+            # If LLM returned nothing useful
+            send_whatsapp_message(customer_phone, "No valid items detected. Please specify menu items with quantities, or 'confirm' / 'cancel'.")
             return jsonify({"status": "ok"})
 
     except KeyError as e:
